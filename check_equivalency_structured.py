@@ -1,46 +1,46 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as opt
+import copy
 from repoptimizer.repoptimizer_utils import RepOptimizerHandler
 from repoptimizer.repoptimizer_sgd import RepOptimizerSGD
 from repoptimizer.repoptimizer_adamw import RepOptimizerAdamW
 
-num_train_iters = 10010
+num_train_iters = 100000
 lr = 0.01
 momentum = 0.0
 weight_decay = 0.0
 nest = False
 
 test_scales = (0.233, 0.555)
-in_channels = 3
-out_channels = 1
+in_channels = 4
+out_channels = 4
 in_h, in_w = 8, 8
 batch_size = 4
 
-train_data = []
+
+# Checking equivalency of RepOptimizer by training a model with structured data
+# Unstructured data is esentially noise, which leads to exploding divergences when
+# training - i.e., it displays chaotic behaviour.
+
+rand_data = []
+train_y = []
 for _ in range(num_train_iters):
-    train_data.append(torch.randn(batch_size, in_channels, in_h, in_w))
+    rand_data.append(torch.randn(batch_size, in_channels, in_h, in_w))
 
 class TestModel(nn.Module):
 
     def __init__(self, scales):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, 1, padding=1, bias=True)
-        #self.conv2 = nn.Conv2d(in_channels, out_channels, 1, 1, padding=0, bias=True)
-        self.conv2 = nn.Conv2d(in_channels, out_channels, 3, 1, padding=1, bias=True)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, 1, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(in_channels, out_channels, 1, 1, padding=0, bias=False)
         self.scales = scales
 
     def forward(self, x):
         return self.conv1(x) * self.scales[0] + self.conv2(x) * self.scales[1]
 
 def get_equivalent_kernel(model):
-    #return model.conv1.weight * test_scales[0] + F.pad(model.conv2.weight * test_scales[1], [1,1,1,1])
-    # return model.conv1.weight * test_scales[0] + model.conv2.weight * test_scales[1]
-    return {
-        "weight": model.conv1.weight * test_scales[0] + model.conv2.weight * test_scales[1],
-        "bias": model.conv1.bias * test_scales[0] + model.conv2.bias * test_scales[1]
-    }
+    return model.conv1.weight * test_scales[0] + F.pad(model.conv2.weight * test_scales[1], [1,1,1,1])
 
 class TestSGDHandler(RepOptimizerHandler):
 
@@ -50,19 +50,9 @@ class TestSGDHandler(RepOptimizerHandler):
         self.scales = scales
 
     def generate_grad_mults(self):
-        weight_mask = torch.ones_like(self.model.weight) * self.scales[0] ** 2
-        #weight_mask[:, :, 1, 1] += self.scales[1] ** 2
-        weight_mask += self.scales[1] ** 2
-
-
-        bias_mask = torch.zeros_like(self.model.bias)
-        bias_mask += self.scales[0] ** 2 + self.scales[1] ** 2
-
-        params = {
-            self.model.weight: weight_mask,
-            self.model.bias: bias_mask
-        }
-        return params
+        mask = torch.ones_like(self.model.weight) * self.scales[0] ** 2
+        mask[:, :, 1, 1] += self.scales[1] ** 2
+        return {self.model.weight: mask}
 
 class TestAdamWHandler(RepOptimizerHandler):
 
@@ -72,9 +62,35 @@ class TestAdamWHandler(RepOptimizerHandler):
         self.scales = scales
 
     def generate_grad_mults(self):
-        weight_mask = torch.ones_like(self.model.weight) * self.scales[0]
-        weight_mask[:, :, 1, 1] += self.scales[1]
-        return {self.model.weight: weight_mask}
+        mask = torch.ones_like(self.model.weight) * self.scales[0]
+        mask[:, :, 1, 1] += self.scales[1]
+        return {self.model.weight: mask}
+
+
+def gen_dataset():
+    print('################################# generating data')
+
+
+    # To generate a dataset with the required structure, we create a model with the same arch,
+    # train it on random data, and then generate data from it with added noise
+    model = TestModel(test_scales)
+    model.train()
+
+    optimizer = torch.optim.SGD(params=model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+
+    for i in range(100):
+        x = rand_data[i]
+        y = model(x)
+        optimizer.zero_grad()
+        loss = y.var()
+        loss.backward()
+        optimizer.step()
+
+    for i in range(num_train_iters):
+        train_y.append(model(rand_data[i]))
+
+    print('################################# dataset succesfully generated')
+
 
 
 
@@ -95,43 +111,41 @@ def check_equivalency(update_rule):
         optimizer = torch.optim.AdamW(params=model.parameters(), eps=1e-8, betas=(0.9, 0.999), lr=lr, weight_decay=weight_decay)
 
     for i in range(num_train_iters):
-        x = train_data[i]
+        x = rand_data[i]
         y = model(x)
         optimizer.zero_grad()
-        loss = y.var()      #   just an arbitrary loss function.
-        loss.backward()
+        loss = F.mse_loss(y, train_y[i], reduction='mean')
+        loss.backward(retain_graph=True)
         optimizer.step()
 
     print('============== finished training the original model')
 
-    eq_model = nn.Conv2d(in_channels, out_channels, 3, 1, padding=1, bias=True)
-    eq_model.weight.data = init_weights["weight"]
-    eq_model.bias.data = init_weights["bias"]
 
-
+    eq_model = nn.Conv2d(in_channels, out_channels, 3, 1, padding=1, bias=False)
+    eq_model.weight.data = init_weights
 
     if update_rule == 'sgd':
         handler = TestSGDHandler(eq_model, scales=test_scales)
-        eq_optimizer = RepOptimizerSGD(handler.generate_grad_mults(), eq_model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=nest)
-        # eq_optimizer = opt.SGD(eq_model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+        eq_optimizer = RepOptimizerSGD(handler.generate_grad_mults(), eq_model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
     else:
         handler = TestAdamWHandler(eq_model, scales=test_scales)
         eq_optimizer = RepOptimizerAdamW(handler.generate_grad_mults(), eq_model.parameters(), eps=1e-8, betas=(0.9, 0.999), lr=lr,
                                       weight_decay=weight_decay)
 
     for i in range(num_train_iters):
-        x = train_data[i]
+        x = rand_data[i]
         y = eq_model(x)
         eq_optimizer.zero_grad()
-        loss = y.var()
-        loss.backward()
+        loss = F.mse_loss(y, train_y[i], reduction='mean')
+        loss.backward(retain_graph=True)
         eq_optimizer.step()
 
     print('============== finished training the equivalent model')
     print('============== the relative difference is ')
-    print((eq_model.weight.data - get_equivalent_kernel(model)["weight"]).abs().sum() / eq_model.weight.abs().sum())
+    print((eq_model.weight.data - get_equivalent_kernel(model)).abs().sum() / eq_model.weight.abs().sum())
 
 
+gen_dataset()
 check_equivalency('sgd')
-#check_equivalency('adamw')
+check_equivalency('adamw')
 exit()
