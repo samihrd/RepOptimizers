@@ -112,6 +112,6 @@ def check_equivalency(update_rule):
     print((eq_model.weight.data - get_equivalent_kernel(model)).abs().sum() / eq_model.weight.abs().sum())
 
 
-check_equivalency('sgd')
-# check_equivalency('adamw')
+#check_equivalency('sgd')
+check_equivalency('adamw')
 exit()

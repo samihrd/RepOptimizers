@@ -6,7 +6,7 @@ from repoptimizer.repoptimizer_utils import RepOptimizerHandler
 from repoptimizer.repoptimizer_sgd import RepOptimizerSGD
 from repoptimizer.repoptimizer_adamw import RepOptimizerAdamW
 
-num_train_iters = 100000
+num_train_iters = 10000
 lr = 0.01
 momentum = 0.0
 weight_decay = 0.0
@@ -33,14 +33,22 @@ class TestModel(nn.Module):
     def __init__(self, scales):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, 1, padding=1, bias=False)
-        self.conv2 = nn.Conv2d(in_channels, out_channels, 1, 1, padding=0, bias=False)
+        self.conv2 = nn.Conv2d(in_channels, out_channels, 3, 1, padding=1, bias=False)
         self.scales = scales
 
     def forward(self, x):
         return self.conv1(x) * self.scales[0] + self.conv2(x) * self.scales[1]
 
 def get_equivalent_kernel(model):
-    return model.conv1.weight * test_scales[0] + F.pad(model.conv2.weight * test_scales[1], [1,1,1,1])
+    eq_kernel = {}
+    eq_kernel["weight"] = model.conv1.weight * test_scales[0] + model.conv2.weight * test_scales[1]
+
+    try:
+        eq_kernel["bias"] = model.conv1.bias * test_scales[0] + model.conv2.bias * test_scales[1]
+    except:
+        pass
+
+    return eq_kernel
 
 class TestSGDHandler(RepOptimizerHandler):
 
@@ -50,9 +58,14 @@ class TestSGDHandler(RepOptimizerHandler):
         self.scales = scales
 
     def generate_grad_mults(self):
-        mask = torch.ones_like(self.model.weight) * self.scales[0] ** 2
-        mask[:, :, 1, 1] += self.scales[1] ** 2
-        return {self.model.weight: mask}
+        params = {}
+
+        params[self.model.weight] = torch.zeros_like(self.model.weight) + self.scales[0] ** 2 + self.scales[1] ** 2
+
+        if self.model.bias:
+            params[self.model.bias] = torch.zeros_like(self.model.bias) + self.scales[0] ** 2 + self.scales[1] ** 2
+
+        return params
 
 class TestAdamWHandler(RepOptimizerHandler):
 
@@ -62,17 +75,21 @@ class TestAdamWHandler(RepOptimizerHandler):
         self.scales = scales
 
     def generate_grad_mults(self):
-        mask = torch.ones_like(self.model.weight) * self.scales[0]
-        mask[:, :, 1, 1] += self.scales[1]
-        return {self.model.weight: mask}
+        params = {}
+
+        params[self.model.weight] = torch.zeros_like(self.model.weight) + self.scales[0] ** 2 + self.scales[1] ** 2
+
+        if self.model.bias:
+            params[self.model.bias] = torch.zeros_like(self.model.bias) + self.scales[0] ** 2 + self.scales[1] ** 2
+
+        return params
 
 
 def gen_dataset():
-    print('################################# generating data')
-
-
     # To generate a dataset with the required structure, we create a model with the same arch,
     # train it on random data, and then generate data from it with added noise
+    print('################################# generating data')
+
     model = TestModel(test_scales)
     model.train()
 
@@ -122,7 +139,9 @@ def check_equivalency(update_rule):
 
 
     eq_model = nn.Conv2d(in_channels, out_channels, 3, 1, padding=1, bias=False)
-    eq_model.weight.data = init_weights
+    eq_model.weight.data = init_weights["weight"]
+    if eq_model.bias:
+        eq_model.bias.data = init_weights["bias"]
 
     if update_rule == 'sgd':
         handler = TestSGDHandler(eq_model, scales=test_scales)
@@ -142,7 +161,7 @@ def check_equivalency(update_rule):
 
     print('============== finished training the equivalent model')
     print('============== the relative difference is ')
-    print((eq_model.weight.data - get_equivalent_kernel(model)).abs().sum() / eq_model.weight.abs().sum())
+    print((eq_model.weight.data - get_equivalent_kernel(model)["weight"]).abs().sum() / eq_model.weight.abs().sum())
 
 
 gen_dataset()
